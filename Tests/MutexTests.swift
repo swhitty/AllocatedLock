@@ -51,11 +51,11 @@ final class MutexTests: XCTestCase {
 
     func testLockIfAvailable_ReturnsValue() {
         let mutex = Mutex("fish")
-        mutex.lock.unsafeLock()
+        mutex.storage.lock()
         XCTAssertNil(
             mutex.withLockIfAvailable { _ in "chips" }
         )
-        mutex.lock.unsafeUnlock()
+        mutex.storage.unlock()
         XCTAssertEqual(
             mutex.withLockIfAvailable { _ in "chips" },
             "chips"

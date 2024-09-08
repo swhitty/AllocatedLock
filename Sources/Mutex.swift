@@ -1,9 +1,9 @@
 //
-//  Mutex.swift
+//  AllocatedLock.swift
 //  swift-mutex
 //
-//  Created by Simon Whitty on 07/09/2024.
-//  Copyright 2024 Simon Whitty
+//  Created by Simon Whitty on 10/04/2023.
+//  Copyright 2023 Simon Whitty
 //
 //  Distributed under the permissive MIT license
 //  Get the latest version from here:
@@ -29,82 +29,169 @@
 //  SOFTWARE.
 //
 
-// Backports the Swift 6 type Mutex<Value> to all Darwin platforms
-
-// @available(macOS, deprecated: 15.0, message: "use Mutex from Synchronization module included with Swift 6")
-// @available(iOS, deprecated: 18.0, message: "use Mutex from Synchronization module included with Swift 6")
-// @available(tvOS, deprecated: 18.0, message: "use Mutex from Synchronization module included with Swift 6")
-// @available(watchOS, deprecated: 11.0, message: "use Mutex from Synchronization module included with Swift 6")
-// @available(visionOS, deprecated: 2.0, message: "use Mutex from Synchronization module included with Swift 6")
-public struct Mutex<Value>: Sendable {
-    let lock: AllocatedLock<Value> // Compatible with OSAllocatedUnfairLock iOS 16+
+// Backports the Swift interface around OSAllocatedUnfairLock available in recent Darwin platforms
+public struct Mutex<Value>: @unchecked Sendable {
+    let storage: Storage
 }
 
 #if compiler(>=6)
 public extension Mutex {
     init(_ initialValue: consuming sending Value) {
-        self.lock = AllocatedLock(uncheckedState: initialValue)
+        self.storage = Storage(initialValue)
     }
 
     borrowing func withLock<Result, E: Error>(
         _ body: (inout sending Value) throws(E) -> sending Result
     ) throws(E) -> sending Result {
-        do {
-            return try lock.withLockUnchecked { value in
-                nonisolated(unsafe) var copy = value
-                defer { value = copy }
-                return try Transferring(body(&copy))
-            }.value
-        } catch let error as E {
-            throw error
-        } catch {
-            preconditionFailure("cannot occur")
-        }
+        storage.lock()
+        defer { storage.unlock() }
+        return try body(&storage.value)
     }
 
     borrowing func withLockIfAvailable<Result, E>(
         _ body: (inout sending Value) throws(E) -> sending Result
     ) throws(E) -> sending Result? where E: Error {
-        do {
-            return try lock.withLockIfAvailableUnchecked { value in
-                nonisolated(unsafe) var copy = value
-                defer { value = copy }
-                return try Transferring(body(&copy))
-            }?.value
-        } catch let error as E {
-            throw error
-        } catch {
-            preconditionFailure("cannot occur")
-        }
-    }
-}
-private struct Transferring<T> {
-    nonisolated(unsafe) var value: T
-
-    init(_ value: T) {
-        self.value = value
+        guard storage.tryLock() else { return nil }
+        defer { storage.unlock() }
+        return try body(&storage.value)
     }
 }
 #else
 public extension Mutex {
-    init(_ initialValue: consuming Value) {
-        self.lock = AllocatedLock(uncheckedState: initialValue)
+    init(_ initialValue: Value) {
+        self.storage = Storage(initialValue)
     }
 
     borrowing func withLock<Result>(
         _ body: (inout Value) throws -> Result
     ) rethrows -> Result {
-        try lock.withLockUnchecked {
-            return try body(&$0)
-        }
+        storage.lock()
+        defer { storage.unlock() }
+        return try body(&storage.value)
     }
 
     borrowing func withLockIfAvailable<Result>(
         _ body: (inout Value) throws -> Result
     ) rethrows -> Result? {
-        try lock.withLockIfAvailableUnchecked {
-            return try body(&$0)
+        guard storage.tryLock() else { return nil }
+        defer { storage.unlock() }
+        return try body(&storage.value)
+    }
+}
+#endif
+
+#if canImport(Darwin)
+
+import struct os.os_unfair_lock_t
+import struct os.os_unfair_lock
+import func os.os_unfair_lock_lock
+import func os.os_unfair_lock_unlock
+import func os.os_unfair_lock_trylock
+
+extension Mutex {
+
+    final class Storage {
+        private let _lock: os_unfair_lock_t
+
+        var value: Value
+
+        init(_ initialValue: Value) {
+            self._lock = .allocate(capacity: 1)
+            self._lock.initialize(to: os_unfair_lock())
+            self.value = initialValue
+        }
+
+        func lock() {
+            os_unfair_lock_lock(_lock)
+        }
+
+        func unlock() {
+            os_unfair_lock_unlock(_lock)
+        }
+
+        func tryLock() -> Bool {
+            os_unfair_lock_trylock(_lock)
+        }
+
+        deinit {
+            self._lock.deinitialize(count: 1)
+            self._lock.deallocate()
         }
     }
 }
+
+#elseif canImport(Glibc)
+
+import Glibc
+
+extension Mutex {
+
+    final class Storage {
+        private let _lock: UnsafeMutablePointer<pthread_mutex_t>
+
+        var value: Value
+
+        init(_ initialValue: Value) {
+            var attr = pthread_mutexattr_t()
+            pthread_mutexattr_init(&attr)
+            self._lock = .allocate(capacity: 1)
+            let err = pthread_mutex_init(self._lock, &attr)
+            precondition(err == 0, "pthread_mutex_init error: \(err)")
+            self.value = initialValue
+        }
+
+        func lock() {
+            let err = pthread_mutex_lock(_lock)
+            precondition(err == 0, "pthread_mutex_lock error: \(err)")
+        }
+
+        func unlock() {
+            let err = pthread_mutex_unlock(_lock)
+            precondition(err == 0, "pthread_mutex_unlock error: \(err)")
+        }
+
+        func tryLock() -> Bool {
+            pthread_mutex_trylock(_lock) == 0
+        }
+
+        deinit {
+            let err = pthread_mutex_destroy(self._lock)
+            precondition(err == 0, "pthread_mutex_destroy error: \(err)")
+            self._lock.deallocate()
+        }
+    }
+}
+
+#elseif canImport(WinSDK)
+
+import ucrt
+import WinSDK
+
+extension Mutex {
+
+    final class Storage {
+        private let _lock: UnsafeMutablePointer<SRWLOCK>
+
+        var value: Value
+
+        init(_ initialValue: Value) {
+            self._lock = .allocate(capacity: 1)
+            InitializeSRWLock(self._lock)
+            self.value = initialValue
+        }
+
+        func lock() {
+            AcquireSRWLockExclusive(_lock)
+        }
+
+        func unlock() {
+            ReleaseSRWLockExclusive(_lock)
+        }
+
+        func tryLock() -> Bool {
+            TryAcquireSRWLockExclusive(_lock)
+        }
+    }
+}
+
 #endif
